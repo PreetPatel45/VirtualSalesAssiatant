@@ -212,10 +212,6 @@ System includes monitoring for:
 3. Test changes thoroughly
 4. Submit pull request
 
-## License
-
-MIT License - see LICENSE file for details.
-
 ## Acknowledgments
 
 - Google FLAN-T5 model from Hugging Face
