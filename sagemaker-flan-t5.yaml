@@ -1,0 +1,41 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy SageMaker endpoint for google/flan-t5-small
+
+Parameters:
+  SageMakerExecutionRoleArn:
+    Type: String
+    Description: IAM role ARN with SageMaker permissions
+
+Resources:
+  SageMakerModel:
+    Type: AWS::SageMaker::Model
+    Properties:
+      ModelName: FlanT5Model
+      ExecutionRoleArn: !Ref SageMakerExecutionRoleArn
+      PrimaryContainer:
+        Image: 763104351884.dkr.ecr.us-east-1.amazonaws.com/huggingface-pytorch-inference:1.13.1-transformers4.26.0-cpu-py39-ubuntu20.04
+        Environment:
+          HF_MODEL_ID: google/flan-t5-small
+          HF_TASK: text2text-generation
+
+  SageMakerEndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    DependsOn: SageMakerModel  # Explicit dependency
+    Properties:
+      EndpointConfigName: FlanT5EPConfig
+      ProductionVariants:
+        - VariantName: AllTraffic
+          ModelName: !GetAtt SageMakerModel.ModelName  # Get actual model name
+          InstanceType: ml.t2.medium
+          InitialInstanceCount: 1
+
+  SageMakerEndpoint:
+    Type: AWS::SageMaker::Endpoint
+    DependsOn: SageMakerEndpointConfig  # Explicit dependency
+    Properties:
+      EndpointName: FlanT5Endpoint
+      EndpointConfigName: !GetAtt SageMakerEndpointConfig.EndpointConfigName  # Get actual config name
+
+Outputs:
+  EndpointName:
+    Value: !Ref SageMakerEndpoint

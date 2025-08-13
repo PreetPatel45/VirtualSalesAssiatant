@@ -1,0 +1,388 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for OpenSearch RAG pipeline with S3, Lambda, and EventBridge
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Unique name for the S3 bucket
+    Default: rag-documents-300615130599
+  OpenSearchDomainName:
+    Type: String
+    Description: Name of the OpenSearch domain
+    Default: rag-opensearch
+  LambdaFunctionName:
+    Type: String
+    Description: Name of the Lambda function
+    Default: RagEmbeddingLambda
+
+Resources:
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AndOpenSearchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${BucketName}/*'
+              - Effect: Allow
+                Action:
+                  - es:ESHttpDelete
+                  - es:ESHttpGet
+                  - es:ESHttpHead
+                  - es:ESHttpPost
+                  - es:ESHttpPut
+                Resource: !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${OpenSearchDomainName}/*'
+
+  # S3 Bucket with EventBridge enabled
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # OpenSearch Domain (free tier eligible)
+  OpenSearchDomain:
+    Type: AWS::OpenSearchService::Domain
+    Properties:
+      DomainName: !Ref OpenSearchDomainName
+      EngineVersion: OpenSearch_2.11
+      ClusterConfig:
+        InstanceType: t3.small.search
+        InstanceCount: 1
+        DedicatedMasterEnabled: false
+        ZoneAwarenessEnabled: false
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: gp3
+        VolumeSize: 10
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt LambdaExecutionRole.Arn
+            Action: 
+              - es:ESHttpDelete
+              - es:ESHttpGet
+              - es:ESHttpHead
+              - es:ESHttpPost
+              - es:ESHttpPut
+            Resource: !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${OpenSearchDomainName}/*'
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 
+              - es:ESHttpDelete
+              - es:ESHttpGet
+              - es:ESHttpHead
+              - es:ESHttpPost
+              - es:ESHttpPut
+            Resource: !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${OpenSearchDomainName}/*'
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+
+  # Lambda Function with simplified embedding logic
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib.parse
+          import os
+          import hashlib
+          import re
+          from urllib.request import Request, urlopen
+          from urllib.error import URLError
+          import base64
+          import hmac
+          from datetime import datetime
+          
+          s3_client = boto3.client('s3')
+          
+          def simple_tokenize(text):
+              """Simple tokenization using regex"""
+              words = re.findall(r'\b\w+\b', text.lower())
+              return words
+          
+          def create_simple_embedding(text, dim=100):
+              """Create a simple hash-based embedding vector"""
+              words = simple_tokenize(text)
+              
+              embedding = [0.0] * dim
+              
+              for word in words:
+                  hash_val = int(hashlib.md5(word.encode()).hexdigest(), 16)
+                  for i in range(dim):
+                      embedding[i] += (hash_val >> i) % 3 - 1
+              
+              magnitude = sum(x*x for x in embedding) ** 0.5
+              if magnitude > 0:
+                  embedding = [x/magnitude for x in embedding]
+              
+              return embedding
+          
+          def chunk_text(text, max_words=100):
+              """Split text into chunks of approximately max_words"""
+              words = text.split()
+              chunks = []
+              
+              for i in range(0, len(words), max_words):
+                  chunk = ' '.join(words[i:i + max_words])
+                  if chunk.strip():
+                      chunks.append(chunk.strip())
+              
+              return chunks
+          
+          def sign_request(method, url, region, service, access_key, secret_key, session_token, payload):
+              """Sign AWS request using SigV4"""
+              def sign(key, msg):
+                  return hmac.new(key, msg.encode('utf-8'), hashlib.sha256).digest()
+              
+              def getSignatureKey(key, dateStamp, regionName, serviceName):
+                  kDate = sign(('AWS4' + key).encode('utf-8'), dateStamp)
+                  kRegion = sign(kDate, regionName)
+                  kService = sign(kRegion, serviceName)
+                  kSigning = sign(kService, 'aws4_request')
+                  return kSigning
+              
+              from urllib.parse import urlparse
+              parsed_url = urlparse(url)
+              host = parsed_url.netloc
+              canonical_uri = parsed_url.path
+              
+              t = datetime.utcnow()
+              amzdate = t.strftime('%Y%m%dT%H%M%SZ')
+              datestamp = t.strftime('%Y%m%d')
+              
+              canonical_querystring = ''
+              canonical_headers = f'host:{host}\nx-amz-date:{amzdate}\n'
+              if session_token:
+                  canonical_headers += f'x-amz-security-token:{session_token}\n'
+              
+              signed_headers = 'host;x-amz-date'
+              if session_token:
+                  signed_headers += ';x-amz-security-token'
+              
+              payload_hash = hashlib.sha256(payload.encode('utf-8')).hexdigest()
+              canonical_request = f'{method}\n{canonical_uri}\n{canonical_querystring}\n{canonical_headers}\n{signed_headers}\n{payload_hash}'
+              
+              algorithm = 'AWS4-HMAC-SHA256'
+              credential_scope = f'{datestamp}/{region}/{service}/aws4_request'
+              string_to_sign = f'{algorithm}\n{amzdate}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()}'
+              
+              signing_key = getSignatureKey(secret_key, datestamp, region, service)
+              signature = hmac.new(signing_key, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
+              
+              authorization_header = f'{algorithm} Credential={access_key}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}'
+              
+              return {
+                  'Authorization': authorization_header,
+                  'x-amz-date': amzdate,
+                  'x-amz-security-token': session_token if session_token else None
+              }
+          
+          def index_to_opensearch(domain_endpoint, index_name, doc_id, document):
+              """Index document to OpenSearch using signed requests"""
+              session = boto3.Session()
+              credentials = session.get_credentials()
+              
+              # Get region from context instead of environment variable
+              region = os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')
+              
+              url = f"https://{domain_endpoint}/{index_name}/_doc/{doc_id}"
+              payload = json.dumps(document)
+              
+              headers = sign_request(
+                  'PUT', url, 
+                  region, 
+                  'es',
+                  credentials.access_key,
+                  credentials.secret_key,
+                  credentials.token,
+                  payload
+              )
+              
+              headers['Content-Type'] = 'application/json'
+              headers = {k: v for k, v in headers.items() if v is not None}
+              
+              req = Request(url, data=payload.encode('utf-8'), headers=headers, method='PUT')
+              
+              try:
+                  with urlopen(req) as response:
+                      return response.read().decode('utf-8')
+              except URLError as e:
+                  print(f"Error indexing document: {e}")
+                  if hasattr(e, 'read'):
+                      print(f"Error response: {e.read().decode('utf-8')}")
+                  return None
+          
+          def lambda_handler(event, context):
+              print(f"Received event: {json.dumps(event)}")
+              
+              try:
+                  # Handle EventBridge event format
+                  if 'detail' in event:
+                      bucket = event['detail']['bucket']['name']
+                      key = event['detail']['object']['key']
+                  else:
+                      # Direct S3 event format (for testing)
+                      for record in event['Records']:
+                          bucket = record['s3']['bucket']['name']
+                          key = urllib.parse.unquote_plus(record['s3']['object']['key'])
+                  
+                  print(f"Processing file: {key} from bucket: {bucket}")
+                  
+                  # Read text file from S3
+                  try:
+                      response = s3_client.get_object(Bucket=bucket, Key=key)
+                      text = response['Body'].read().decode('utf-8')
+                      print(f"Read {len(text)} characters from file")
+                  except Exception as e:
+                      print(f"Error reading file from S3: {e}")
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps(f'Error reading file: {str(e)}')
+                      }
+                  
+                  # Skip empty files
+                  if not text.strip():
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps('File is empty, skipping')
+                      }
+                  
+                  # Chunk text
+                  chunks = chunk_text(text)
+                  print(f"Created {len(chunks)} chunks")
+                  
+                  # Get OpenSearch domain endpoint
+                  domain_endpoint = os.environ['OPENSEARCH_DOMAIN_ENDPOINT']
+                  
+                  # Index each chunk
+                  indexed_count = 0
+                  for i, chunk in enumerate(chunks):
+                      try:
+                          embedding = create_simple_embedding(chunk)
+                          
+                          document = {
+                              'text': chunk,
+                              'embedding': embedding,
+                              'filename': key,
+                              'chunk_id': i,
+                              'timestamp': context.aws_request_id
+                          }
+                          
+                          doc_id = f"{key.replace('/', '_')}-{i}"
+                          result = index_to_opensearch(domain_endpoint, 'rag-documents', doc_id, document)
+                          
+                          if result:
+                              indexed_count += 1
+                              print(f"Indexed chunk {i}")
+                          else:
+                              print(f"Failed to index chunk {i}")
+                              
+                      except Exception as e:
+                          print(f"Error processing chunk {i}: {e}")
+                          continue
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(f'Successfully indexed {indexed_count}/{len(chunks)} chunks')
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in lambda_handler: {e}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+      Environment:
+        Variables:
+          OPENSEARCH_DOMAIN_ENDPOINT: !GetAtt OpenSearchDomain.DomainEndpoint
+      Timeout: 300
+      MemorySize: 512
+
+  # EventBridge Rule to trigger Lambda on S3 uploads
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Trigger Lambda on S3 document upload
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref BucketName
+          object:
+            key:
+              - suffix: .txt
+      Targets:
+        - Arn: !GetAtt LambdaFunction.Arn
+          Id: LambdaTarget
+
+  # Permission for EventBridge to invoke Lambda
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt LambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EventBridgeRule.Arn
+
+Outputs:
+  S3BucketName:
+    Description: Name of the created S3 bucket
+    Value: !Ref S3Bucket
+  
+  OpenSearchDomainEndpoint:
+    Description: OpenSearch domain endpoint
+    Value: !GetAtt OpenSearchDomain.DomainEndpoint
+  
+  LambdaFunctionName:
+    Description: Name of the Lambda function
+    Value: !Ref LambdaFunction
+  
+  LambdaExecutionRoleArn:
+    Description: ARN of the Lambda execution role
+    Value: !GetAtt LambdaExecutionRole.Arn
+
+
+# (base) preetpatel@Mac Mid-term-project % aws cloudformation create-stack \
+#   --stack-name RagPipelineStack \
+#   --template-body file://opensearch-rag-pipeline.yaml \
+#   --parameters ParameterKey=BucketName,ParameterValue=rag-documents-300615130599 \
+#   --capabilities CAPABILITY_IAM \
+#   --region us-east-1
+# {
+#     "StackId": "arn:aws:cloudformation:us-east-1:300615130599:stack/RagPipelineStack/0f784090-3e45-11f0-925f-0affd4f1204b"
+# }

@@ -1,0 +1,226 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for RAG query Lambda with OpenSearch and SageMaker
+
+Parameters:
+  OpenSearchDomainName:
+    Type: String
+    Description: Name of the OpenSearch domain
+    Default: rag-opensearch
+  LambdaFunctionName:
+    Type: String
+    Description: Name of the Lambda function
+    Default: RagQueryLambda
+  SageMakerEndpointName:
+    Type: String
+    Description: Name of the SageMaker endpoint
+    Default: FlanT5Endpoint
+  LambdaExecutionRoleArn:
+    Type: String
+    Description: ARN of the IAM role for Lambda
+    Default: arn:aws:iam::300615130599:role/RagPipelineStack-LambdaExecutionRole-5FdYCQFmKv8N
+
+Resources:
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Handler: index.lambda_handler
+      Runtime: python3.9
+      Role: !Ref LambdaExecutionRoleArn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import hashlib
+          import re
+          from urllib.request import Request, urlopen
+          from urllib.error import URLError
+          import hmac
+          from datetime import datetime
+          
+          sagemaker_runtime = boto3.client('sagemaker-runtime')
+          
+          def sign_request(method, url, region, service, access_key, secret_key, session_token, payload):
+              def sign(key, msg):
+                  return hmac.new(key, msg.encode('utf-8'), hashlib.sha256).digest()
+              
+              def getSignatureKey(key, dateStamp, regionName, serviceName):
+                  kDate = sign(('AWS4' + key).encode('utf-8'), dateStamp)
+                  kRegion = sign(kDate, regionName)
+                  kService = sign(kRegion, serviceName)
+                  kSigning = sign(kService, 'aws4_request')
+                  return kSigning
+              
+              from urllib.parse import urlparse
+              parsed_url = urlparse(url)
+              host = parsed_url.netloc
+              canonical_uri = parsed_url.path
+              
+              t = datetime.utcnow()
+              amzdate = t.strftime('%Y%m%dT%H%M%SZ')
+              datestamp = t.strftime('%Y%m%d')
+              
+              canonical_querystring = ''
+              canonical_headers = f'host:{host}\nx-amz-date:{amzdate}\n'
+              if session_token:
+                  canonical_headers += f'x-amz-security-token:{session_token}\n'
+              
+              signed_headers = 'host;x-amz-date'
+              if session_token:
+                  signed_headers += ';x-amz-security-token'
+              
+              payload_hash = hashlib.sha256(payload.encode('utf-8')).hexdigest()
+              canonical_request = f'{method}\n{canonical_uri}\n{canonical_querystring}\n{canonical_headers}\n{signed_headers}\n{payload_hash}'
+              
+              algorithm = 'AWS4-HMAC-SHA256'
+              credential_scope = f'{datestamp}/{region}/{service}/aws4_request'
+              string_to_sign = f'{algorithm}\n{amzdate}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()}'
+              
+              signing_key = getSignatureKey(secret_key, datestamp, region, service)
+              signature = hmac.new(signing_key, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
+              
+              authorization_header = f'{algorithm} Credential={access_key}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}'
+              
+              return {
+                  'Authorization': authorization_header,
+                  'x-amz-date': amzdate,
+                  'x-amz-security-token': session_token if session_token else None
+              }
+          
+          def search_opensearch(domain_endpoint, query_text):
+              session = boto3.Session()
+              credentials = session.get_credentials()
+              region = os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')
+              
+              search_body = {
+                  "query": {
+                      "multi_match": {
+                          "query": query_text,
+                          "fields": ["text"],
+                          "type": "best_fields",
+                          "fuzziness": "AUTO"
+                      }
+                  },
+                  "size": 3,
+                  "highlight": {
+                      "fields": {
+                          "text": {}
+                      }
+                  }
+              }
+              
+              url = f"https://{domain_endpoint}/rag-documents/_search"
+              payload = json.dumps(search_body)
+              
+              headers = sign_request(
+                  'POST', url, 
+                  region, 
+                  'es',
+                  credentials.access_key,
+                  credentials.secret_key,
+                  credentials.token,
+                  payload
+              )
+              
+              headers['Content-Type'] = 'application/json'
+              headers = {k: v for k, v in headers.items() if v is not None}
+              
+              req = Request(url, data=payload.encode('utf-8'), headers=headers, method='POST')
+              
+              try:
+                  with urlopen(req) as response:
+                      return json.loads(response.read().decode('utf-8'))
+              except URLError as e:
+                  print(f"Error searching OpenSearch: {e}")
+                  if hasattr(e, 'read'):
+                      print(f"Error response: {e.read().decode('utf-8')}")
+                  return None
+          
+          def lambda_handler(event, context):
+              try:
+                  query = event.get('query', '')
+                  if not query:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps('Query is required')
+                      }
+                  
+                  domain_endpoint = os.environ['OPENSEARCH_DOMAIN_ENDPOINT']
+                  
+                  search_response = search_opensearch(domain_endpoint, query)
+                  
+                  if not search_response or 'hits' not in search_response:
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'query': query,
+                              'context': 'No relevant documents found',
+                              'answer': 'I could not find relevant information to answer your query.'
+                          })
+                      }
+                  
+                  context = ''
+                  for hit in search_response['hits']['hits']:
+                      context += hit['_source']['text'] + '\n'
+                  
+                  if not context.strip():
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'query': query,
+                              'context': 'No relevant documents found',
+                              'answer': 'I could not find relevant information to answer your query.'
+                          })
+                      }
+                  
+                  prompt = f"Context:\n{context}\n\nQuery: {query}\n\nAnswer:"
+                  
+                  try:
+                      sagemaker_response = sagemaker_runtime.invoke_endpoint(
+                          EndpointName=os.environ['SAGEMAKER_ENDPOINT'],
+                          ContentType='application/json',
+                          Body=json.dumps({'inputs': prompt, 'parameters': {'max_length': 200}})
+                      )
+                      result = json.loads(sagemaker_response['Body'].read().decode())
+                      answer = result[0].get('generated_text', 'No response from SageMaker')
+                  except Exception as sagemaker_error:
+                      print(f"SageMaker error: {sagemaker_error}")
+                      answer = f"Based on the available information: {context[:200]}..."
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'query': query,
+                          'context': context,
+                          'answer': answer
+                      })
+                  }
+              
+              except Exception as e:
+                  print(f"Error: {e}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'Error: {str(e)}')
+                  }
+      Environment:
+        Variables:
+          OPENSEARCH_DOMAIN_ENDPOINT: search-rag-opensearch-pra6imbadyj546g4b5pfn2sig4.us-east-1.es.amazonaws.com
+          SAGEMAKER_ENDPOINT: !Ref SageMakerEndpointName
+      Timeout: 120
+      MemorySize: 512
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt LambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+
+Outputs:
+  LambdaFunctionName:
+    Description: Name of the Lambda function
+    Value: !Ref LambdaFunction
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt LambdaFunction.Arn

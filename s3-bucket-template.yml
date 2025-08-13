@@ -1,0 +1,31 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: S3 bucket for Chatbot model artifacts
+
+Parameters:
+  BucketName:
+    Type: String
+    Default: chatbot-models-abc4567
+    Description: Name of the S3 bucket for model artifacts
+
+Resources:
+  ModelBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+
+Outputs:
+  BucketName:
+    Description: Name of the created S3 bucket
+    Value: !Ref ModelBucket
+  BucketArn:
+    Description: ARN of the created S3 bucket
+    Value: !GetAtt ModelBucket.Arn
